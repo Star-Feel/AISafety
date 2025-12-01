@@ -18,6 +18,8 @@ cd DiffAttack/third_party/pytorch_cifar
 python main.py --model_name simpledla
 ```
 
+checkpoints will be saved at `DiffAttack/third_party/pytorch_cifar/checkpoint`
+
 **Generate adversarial images**
 1. Download Stable Diffusion checkpoint
 ```
