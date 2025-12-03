@@ -1,0 +1,25 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# !data/
+!data/images/
+!data/images.csv
+
+# C extensions
+*.so
+*.pth
+*.zip
+*.jpg
+*.JPEG
+*.mp4
+*.pdf
+*.gz
+*.pkl
+*.npy
+
+# Distribution / packaging
+.Python
+build/
+datasets/
