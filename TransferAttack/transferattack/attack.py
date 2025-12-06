@@ -4,6 +4,7 @@ import torch.nn as nn
 import numpy as np
 
 from .utils import *
+from robustbench.utils import load_model as load_rbm_model
 
 class Attack(object):
     """
@@ -64,7 +65,11 @@ class Attack(object):
                 print('=> Loading model {} from timm.models'.format(model_name))
                 model = timm.create_model(model_name, pretrained=True)
             else:
-                raise ValueError('Model {} not supported'.format(model_name))
+                try:
+                    print('=> Loading model {} from robustbench'.format(model_name))
+                    model = load_rbm_model(model_name=model_name, norm='Linf', dataset='cifar10', threat_model='Linf')
+                except:
+                    raise ValueError('Model {} not supported'.format(model_name))
             return wrap_model(model.eval().cuda())
 
         if isinstance(model_name, list):

@@ -96,6 +96,22 @@ python pipeline.py \
 For targeted experiments pass `--targeted --target_file path/to/targets.txt` (file format mirrors `label.txt`). A successful run will produce adversarial samples under `attackout/` plus evaluation logs in `log/`.
 
 ## Attacks and Models
+### 鲁棒骨干网络集成
+
+
+```bash
+cd /media/homework/AISAFETY/AISafety/TransferAttack &&
+python pipeline.py \
+  --clean_dir datasets/CIFAR10_clean \
+  --cifar_root datasets/CIFAR10 \
+  --attacks anda \
+  --skip_finetune \
+  --attack_ensembles Bartoldson2024Adversarial_WRN-94-16+Debenedetti2022Light_XCiT-L12+Bai2023Improving_edm \
+  --robust_models Bartoldson2024Adversarial_WRN-94-16 Debenedetti2022Light_XCiT-L12 Bai2023Improving_edm \
+  --robust_dataset cifar10 \
+  --robust_threat_model Linf \
+  --batchsize 1
+```
 
 ### Untargeted Attacks
 

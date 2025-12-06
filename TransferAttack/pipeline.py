@@ -24,10 +24,12 @@ from tqdm.auto import tqdm
 
 import transferattack
 from transferattack.utils import EnsembleModel, save_images, wrap_model
+from robustbench.utils import load_model as load_robust_model
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
-LATEST_ATTACKS = ['mef', 'anda', 'mumodig', 'gaa', 'foolmix', 'bsr', 'ops', 'bfa', 'p2fa', 'ana', 'll2s', 'smer']
+# LATEST_ATTACKS = ['mef', 'anda', 'mumodig', 'gaa', 'foolmix', 'bsr', 'ops', 'bfa', 'p2fa', 'ana', 'll2s', 'smer']
+LATEST_ATTACKS = [ 'bsr', 'ops', 'bfa', 'p2fa', 'ana', 'll2s', 'smer']
 SINGLE_MODEL_ONLY_ATTACKS = {'bfa', 'p2fa'}
 
 
@@ -94,6 +96,16 @@ class CIFAR10CleanDataset(Dataset):
     def __getitem__(self, index: int):
         filename, label = self.samples[index]
         image_path = self.img_dir / filename
+        # if not image_path.exists() and self.img_dir != self.root / 'images':
+        #     print(f'[warn] Missing adversarial image {filename} in {self.img_dir}, falling back to clean images')
+        #     fallback_dir = self.root / 'images'
+        #     fallback_path = fallback_dir / filename
+        #     if fallback_path.exists():
+        #         image_path = fallback_path
+        #     else:
+        #         raise FileNotFoundError(
+        #             f"Missing image {filename} in {self.img_dir} and fallback clean directory {fallback_dir}"
+        #         )
         with Image.open(image_path) as img:
             image = img.convert('RGB')
         image = self.resize(image)
@@ -123,8 +135,8 @@ def parse_args():
     parser.add_argument('--results_file', default='log/pipeline_results.json', type=str,
                         help='File to append aggregated JSON metrics')
 
-    parser.add_argument('--surrogates', nargs='+', default=['resnet50', 'vit_base_patch16_224'],
-                        help='Backbones to fine-tune on CIFAR10 and use for attacks')
+    parser.add_argument('--surrogates', nargs='+', default=[],
+                        help='Backbones to fine-tune on CIFAR10 and use for attacks')# default=['resnet50', 'vit_base_patch16_224']
     parser.add_argument('--eval_models', nargs='+', default=None,
                         help='Models used for evaluation (defaults to surrogates)')
     parser.add_argument('--attacks', nargs='+', default=LATEST_ATTACKS,
@@ -159,6 +171,14 @@ def parse_args():
     parser.add_argument('--max_batches', default=None, type=int,
                         help='Debug option: limit number of attack batches')
     parser.add_argument('--gpu', default='0', type=str)
+    parser.add_argument('--robust_models', nargs='*', default=None,
+                        help='Optional RobustBench model names (e.g., Bartoldson2024Adversarial_WRN-94-16) to include during evaluation')
+    parser.add_argument('--robust_dataset', default='cifar10', type=str,
+                        help='Dataset flag passed to RobustBench loader (default: cifar10)')
+    parser.add_argument('--robust_threat_model', default='Linf', type=str,
+                        help='Threat model passed to RobustBench loader (default: Linf)')
+    parser.add_argument('--robust_input_size', default=32, type=int,
+                        help='Spatial size fed into RobustBench backbones (default 32 for CIFAR10 models)')
     return parser.parse_args()
 
 
@@ -374,14 +394,24 @@ def build_attack_model(model_name: str, ckpt_path: Path, num_classes: int, devic
 
 
 def inject_backbones(attacker, ensemble: List[str], ckpt_map: Dict[str, Path], num_classes: int,
-                     device: torch.device):
+                     device: torch.device, args, robust_model_cache: Dict[str, nn.Module],
+                     robust_names: Sequence[str]):
+    robust_name_set = set(robust_names)
+
+    def _load_member(name: str) -> nn.Module:
+        if name in ckpt_map:
+            return build_attack_model(name, ckpt_map[name], num_classes, device)
+        if name in robust_name_set:
+            return build_robust_attack_model(name, args, device, robust_model_cache)
+        raise KeyError(f'Unknown surrogate backbone {name}. Ensure it is either fine-tuned or provided via --robust_models.')
+
     if len(ensemble) == 1:
-        attacker.model = build_attack_model(ensemble[0], ckpt_map[ensemble[0]], num_classes, device)
+        attacker.model = _load_member(ensemble[0])
         attacker.device = device
         if hasattr(attacker, 'propagate_model_to_sub_attacks'):
             attacker.propagate_model_to_sub_attacks()
         return
-    models = [build_attack_model(name, ckpt_map[name], num_classes, device) for name in ensemble]
+    models = [_load_member(name) for name in ensemble]
     attacker.model = EnsembleModel(models)
     attacker.device = attacker.model.device
     if hasattr(attacker, 'propagate_model_to_sub_attacks'):
@@ -436,13 +466,48 @@ def load_eval_model(model_name: str, ckpt_map: Dict[str, Path], num_classes: int
     return model
 
 
+def load_robustbench_backbone(model_name: str, dataset: str, threat_model: str,
+                              device: torch.device) -> nn.Module:
+    model = load_robust_model(model_name=model_name, dataset=dataset, threat_model=threat_model)
+    return model.eval().to(device)
+
+
+class RobustBenchPreprocess(nn.Module):
+
+    def __init__(self, size: int) -> None:
+        super().__init__()
+        self.size = size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-2] == self.size and x.shape[-1] == self.size:
+            return x
+        return F.interpolate(x, size=(self.size, self.size), mode='bilinear', align_corners=False)
+
+
+def build_robust_attack_model(model_name: str, args, device: torch.device,
+                              robust_model_cache: Dict[str, nn.Module]) -> nn.Module:
+    if model_name not in robust_model_cache:
+        backbone = load_robustbench_backbone(
+            model_name,
+            dataset=args.robust_dataset,
+            threat_model=args.robust_threat_model,
+            device=device,
+        )
+        resize_to = getattr(args, 'robust_input_size', None) or args.input_size or 32
+        preprocess = RobustBenchPreprocess(resize_to)
+        model = nn.Sequential(preprocess, backbone).to(device).eval()
+        robust_model_cache[model_name] = model
+    return robust_model_cache[model_name]
+
+
 def compute_arc(acc: float, targeted: bool) -> float:
     return acc if targeted else (1.0 - acc)
 
 
 def evaluate_attack(ensemble_tag: str, attack_name: str, adv_dir: Path, avg_ssim: float,
-                    eval_models: Sequence[str], ckpt_map: Dict[str, Path], args, logger: logging.Logger,
-                    device: torch.device):
+                    eval_models: Sequence[str], robust_models: Sequence[str], ckpt_map: Dict[str, Path],
+                    args, logger: logging.Logger, device: torch.device,
+                    robust_model_cache: Dict[str, nn.Module]):
     dataset = CIFAR10CleanDataset(
         root=args.clean_dir,
         resize_to=args.input_size,
@@ -452,9 +517,9 @@ def evaluate_attack(ensemble_tag: str, attack_name: str, adv_dir: Path, avg_ssim
     )
     loader = DataLoader(dataset, batch_size=args.batchsize, shuffle=False,
                         num_workers=args.workers, pin_memory=True)
-    metrics = []
-    for model_name in eval_models:
-        model = load_eval_model(model_name, ckpt_map, args.num_classes, device)
+    metrics: List[Dict] = []
+
+    def _evaluate_model(model: nn.Module, model_name: str) -> None:
         correct, total = 0, 0
         for images, labels, _ in loader:
             target = labels[1] if args.targeted else labels
@@ -475,9 +540,17 @@ def evaluate_attack(ensemble_tag: str, attack_name: str, adv_dir: Path, avg_ssim
             'score': score,
         })
         logger.info(
-            f'[{attack_name.upper()}|{ensemble_tag}] Eval on {model_name}: '
-            f'acc={acc*100:.2f}% | ARC={arc*100:.2f}% | metric=100*ARC*SSIM={score:.2f}'
+            f'[{attack_name.upper()}|{ensemble_tag}] Eval on {model_name}: ' f'acc={acc*100:.2f}% | ARC={arc*100:.2f}% | metric=100*ARC*SSIM={score:.2f}'
         )
+
+    for model_name in eval_models:
+        model = load_eval_model(model_name, ckpt_map, args.num_classes, device)
+        _evaluate_model(model, model_name)
+
+    for robust_name in robust_models:
+        model = build_robust_attack_model(robust_name, args, device, robust_model_cache)
+        _evaluate_model(model, robust_name)
+
     return metrics
 
 
@@ -548,6 +621,8 @@ def main():
     logger, log_path = setup_logger(Path(args.log_dir))
     logger.info(f'Logs -> {log_path}')
     eval_models = args.eval_models or args.surrogates
+    robust_models = args.robust_models or []
+    robust_model_cache: Dict[str, nn.Module] = {}
 
     ckpt_map = finetune_backbones(args.surrogates, args, device, logger)
     attack_dataset = CIFAR10CleanDataset(
@@ -560,6 +635,13 @@ def main():
                                num_workers=args.workers, pin_memory=True)
 
     base_ensembles = parse_ensembles(args.attack_ensembles, args.surrogates)
+    if args.attack_ensembles is None and robust_models:
+        existing = {tuple(members) for members in base_ensembles}
+        for name in robust_models:
+            key = (name,)
+            if key not in existing:
+                base_ensembles.append([name])
+                existing.add(key)
     all_metrics: List[Dict] = []
     for attack_name in args.attacks:
         attack_ensembles = adjust_ensembles_for_attack(attack_name, base_ensembles, logger)
@@ -576,10 +658,20 @@ def main():
                 targeted=args.targeted,
                 random_start=args.random_start,
             )
-            inject_backbones(attacker, ensemble, ckpt_map, args.num_classes, device)
+            inject_backbones(
+                attacker,
+                ensemble,
+                ckpt_map,
+                args.num_classes,
+                device,
+                args,
+                robust_model_cache,
+                robust_models,
+            )
             avg_ssim, adv_dir = run_attack(attack_name, ensemble, attacker, attack_loader, args, logger)
             metrics = evaluate_attack('+'.join(ensemble), attack_name, adv_dir, avg_ssim,
-                                      eval_models, ckpt_map, args, logger, device)
+                                      eval_models, robust_models, ckpt_map, args, logger, device,
+                                      robust_model_cache)
             all_metrics.extend(metrics)
 
     summary = summarize_results(all_metrics)
