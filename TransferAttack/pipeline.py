@@ -25,12 +25,36 @@ from tqdm.auto import tqdm
 import transferattack
 from transferattack.utils import EnsembleModel, save_images, wrap_model
 from robustbench.utils import load_model as load_robust_model
+import math
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 # LATEST_ATTACKS = ['mef', 'anda', 'mumodig', 'gaa', 'foolmix', 'bsr', 'ops', 'bfa', 'p2fa', 'ana', 'll2s', 'smer']
 LATEST_ATTACKS = [ 'bsr', 'ops', 'bfa', 'p2fa', 'ana', 'll2s', 'smer']
 SINGLE_MODEL_ONLY_ATTACKS = {'bfa', 'p2fa'}
+AVAILABLE_ATTACKS = ['bsr', 'ops', 'bfa', 'p2fa', 'ana', 'smer', 'mef', 'mumodig', 'gaa', 'foolmix', 'anda']
+
+
+def gaussian_kernel(kernel_size=15, sigma=2, channels=3):
+    x_coord = torch.arange(kernel_size)
+    x_grid = x_coord.repeat(kernel_size).view(kernel_size, kernel_size)
+    y_grid = x_grid.t()
+    xy_grid = torch.stack([x_grid, y_grid], dim=-1).float()  # kernel_size*kernel_size*2
+    mean = (kernel_size - 1) / 2.
+    variance = sigma**2.
+    gaussian_kernel = (1. / (2. * math.pi * variance)) * torch.exp(-torch.sum((xy_grid - mean)**2., dim=-1) / (2 * variance))
+    gaussian_kernel = gaussian_kernel / torch.sum(gaussian_kernel)
+    gaussian_kernel = gaussian_kernel.view(1, 1, kernel_size, kernel_size)
+    gaussian_kernel = gaussian_kernel.repeat(channels, 1, 1, 1)
+    gaussian_filter = nn.Conv2d(in_channels=channels,
+                                out_channels=channels,
+                                kernel_size=kernel_size,
+                                groups=channels,
+                                padding=(kernel_size - 1) // 2,
+                                bias=False)
+    gaussian_filter.weight.data = gaussian_kernel
+    gaussian_filter.weight.requires_grad = False
+    return gaussian_filter
 
 
 def split_attack_sequence(name: str) -> List[str]:
@@ -179,6 +203,8 @@ def parse_args():
                         help='Threat model passed to RobustBench loader (default: Linf)')
     parser.add_argument('--robust_input_size', default=32, type=int,
                         help='Spatial size fed into RobustBench backbones (default 32 for CIFAR10 models)')
+    parser.add_argument('--gaussian_smoothing', action='store_true',
+                        help='Apply Gaussian smoothing to inputs before feeding into surrogate models')
     return parser.parse_args()
 
 
@@ -437,7 +463,7 @@ def save_adv_batch(output_dir: Path, tensors: torch.Tensor, filenames: Sequence[
 
 
 def run_attack(attack_name: str, ensemble: List[str], attacker, loader: DataLoader, args,
-               logger: logging.Logger) -> Tuple[float, Path]:
+               logger: logging.Logger, gaussian_smoothing, device) -> Tuple[float, Path]:
     ensemble_tag = '+'.join(ensemble)
     logger.info(f'==> Running {attack_name.upper()} with surrogate [{ensemble_tag}]')
     output_dir = Path(args.attack_out) / attack_dir_slug(attack_name) / ensemble_tag
@@ -446,8 +472,11 @@ def run_attack(attack_name: str, ensemble: List[str], attacker, loader: DataLoad
     for batch_idx, (images, labels, filenames) in enumerate(tqdm(loader, desc=f'{attack_name.upper()}:{ensemble_tag}')):
         if args.max_batches is not None and batch_idx >= args.max_batches:
             break
+        if isinstance(labels, torch.Tensor):
+            labels = labels.to(device, non_blocking=True)
         perturbations = attacker(images, labels)
-        adversaries = torch.clamp(images + perturbations.cpu(), 0.0, 1.0)
+        images = gaussian_smoothing(images.to(device)).to(perturbations.device) if args.gaussian_smoothing else images.to(perturbations.device)
+        adversaries = torch.clamp(images + perturbations, 0.0, 1.0)
         ssim_scores.extend(compute_batch_ssim(images, adversaries))
         save_adv_batch(output_dir, adversaries, filenames, args.save_size)
     avg_ssim = float(np.mean(ssim_scores)) if ssim_scores else 0.0
@@ -643,6 +672,8 @@ def main():
                 base_ensembles.append([name])
                 existing.add(key)
     all_metrics: List[Dict] = []
+    gaussian_smoothing = gaussian_kernel(kernel_size=3, sigma=2, channels=3) # best
+    gaussian_smoothing = gaussian_smoothing.to(device)
     for attack_name in args.attacks:
         attack_ensembles = adjust_ensembles_for_attack(attack_name, base_ensembles, logger)
         if not attack_ensembles:
@@ -668,7 +699,7 @@ def main():
                 robust_model_cache,
                 robust_models,
             )
-            avg_ssim, adv_dir = run_attack(attack_name, ensemble, attacker, attack_loader, args, logger)
+            avg_ssim, adv_dir = run_attack(attack_name, ensemble, attacker, attack_loader, args, logger, gaussian_smoothing, device)
             metrics = evaluate_attack('+'.join(ensemble), attack_name, adv_dir, avg_ssim,
                                       eval_models, robust_models, ckpt_map, args, logger, device,
                                       robust_model_cache)
